@@ -2,6 +2,14 @@ FROM ubuntu:24.04
 
 RUN apt update && apt -y upgrade
 
+RUN apt install -y --no-install-recommends \
+       software-properties-common \
+       gnupg2 ca-certificates curl && \
+    add-apt-repository -y ppa:oisf/suricata-stable && \
+    apt update && \
+    apt install -y --no-install-recommends \
+       suricata vim
+
 RUN apt -y install \
         autoconf \
         automake \
@@ -45,6 +53,7 @@ RUN apt -y install \
         sudo \
         tcpdump \
         time \
+        tmux \
         unzip \
         wget \
         zlib1g \
