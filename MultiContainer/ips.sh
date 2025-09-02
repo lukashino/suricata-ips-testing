@@ -24,8 +24,8 @@ else
     podman run \
            --name "${NAME}" \
            --hostname ips \
-           -v "${HOME}":"${HOME}" \
-           -w "${HOME}" \
+           -v "$(pwd)/firewall/":"$(pwd)/firewall/" \
+           -w "$(pwd)/firewall/" \
            --privileged \
            --rm \
            --interactive --tty \

@@ -28,8 +28,8 @@ else
     podman run \
            --name "${NAME}" \
            --hostname "${NAME}" \
-           -v "${HOME}":"${HOME}" \
-           -w "${HOME}" \
+           -v "$(pwd)/protected/":"$(pwd)/firewall/" \
+           -w "$(pwd)/firewall/" \
            --privileged \
            -e "GATEWAY=${GATEWAY}" \
            -e "PUBLIC_GATEWAY=${PUBLIC_GATEWAY}" \
