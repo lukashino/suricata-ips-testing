@@ -71,6 +71,16 @@ try() {
     "$@" >/dev/null 2>&1 || true
 }
 
+disable_offloads() {
+    local ns="$1"
+    local iface="$2"
+    local feature
+
+    for feature in tso gro lro gso rx tx sg rxvlan txvlan; do
+        try ip netns exec "$ns" ethtool -K "$iface" "$feature" off
+    done
+}
+
 kill_ns_processes() {
     local ns="$1"
     if ip netns list | awk '{print $1}' | grep -qx "$ns"; then
@@ -161,12 +171,15 @@ setup_links() {
     ip link set "$ROOT_IF" mtu "$LAB_MTU"
 
     ip -n "$NS_CLIENT" link set "$VETH_C" up
+    disable_offloads "$NS_CLIENT" "$VETH_C"
     ip -n "$NS_CLIENT" addr replace "$LAB_CLIENT_IP_CIDR" dev "$VETH_C"
     ip -n "$NS_CLIENT" route replace default via "$(client_gateway_ip)"
     ip netns exec "$NS_CLIENT" sysctl -w net.ipv4.ping_group_range="0 2147483647" >/dev/null
 
     ip -n "$NS_DUT" link set "$VETH_D_IN" up
+    disable_offloads "$NS_DUT" "$VETH_D_IN"
     ip -n "$NS_DUT" link set "$VETH_D_OUT" up
+    disable_offloads "$NS_DUT" "$VETH_D_OUT"
     ip netns exec "$NS_DUT" sysctl -w net.ipv4.ping_group_range="0 2147483647" >/dev/null
 
     ip link set "$ROOT_IF" up
@@ -275,6 +288,7 @@ main() {
     need_cmd xargs
     need_cmd sysctl
     need_cmd iptables
+    need_cmd ethtool
 
     local action="${1:-}"
     case "$action" in
