@@ -1,0 +1,14 @@
+%YAML 1.1
+---
+af-packet:
+  - interface: wan0
+    cluster-id: 1
+    copy-mode: ips
+    copy-iface: lan0
+  - interface: lan0
+    cluster-id: 2
+    copy-mode: ips
+    copy-iface: wan0
+  - interface: default
+    threads: auto
+    defrag: false
