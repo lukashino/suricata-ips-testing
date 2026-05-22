@@ -1,0 +1,939 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# Unified Suricata IPS lab command.
+#
+# Commands:
+#   ips-lab up [afp|nfq] [--queue-bypass]
+#   ips-lab down
+#   ips-lab status
+#   ips-lab enter [dut|client|server]
+#   ips-lab setup linux-bridge [up|down]
+
+SUPER_STATE_FILE=${IPS_LAB_STATE_FILE:-/tmp/ips_lab_super.state}
+AFP_STATE_FILE=${IPS_LAB_AFP_STATE_FILE:-/tmp/ips_lab.state}
+NFQ_STATE_FILE=${IPS_LAB_NFQ_STATE_FILE:-/tmp/ips_nfq_lab.state}
+
+NS_CLIENT=${NS_CLIENT:-client}
+NS_DUT=${NS_DUT:-dut}
+NS_SERVER=${NS_SERVER:-server}
+
+LAB_MTU=${LAB_MTU:-1500}
+ROOT_IF=${ROOT_IF:-wanlab0}
+VETH_C=${VETH_C:-eth0}
+VETH_D_IN=${VETH_D_IN:-lan0}
+VETH_D_OUT=${VETH_D_OUT:-wan0}
+
+# AF_PACKET addressing: client and root side only. DUT interfaces are L2 only.
+AFP_LAB_SUBNET_CIDR=${AFP_LAB_SUBNET_CIDR:-${LAB_SUBNET_CIDR:-10.200.0.0/24}}
+AFP_HOST_IP_CIDR=${AFP_HOST_IP_CIDR:-${LAB_HOST_IP_CIDR:-10.200.0.1/24}}
+AFP_CLIENT_IP_CIDR=${AFP_CLIENT_IP_CIDR:-${LAB_CLIENT_IP_CIDR:-10.200.0.2/24}}
+
+# NFQUEUE addressing: routed client <-> DUT <-> root side.
+CLIENT_SUBNET_CIDR=${CLIENT_SUBNET_CIDR:-10.200.0.0/24}
+CLIENT_IP_CIDR=${CLIENT_IP_CIDR:-10.200.0.2/24}
+DUT_LAN_IP_CIDR=${DUT_LAN_IP_CIDR:-10.200.0.1/24}
+UPLINK_SUBNET_CIDR=${UPLINK_SUBNET_CIDR:-10.201.0.0/24}
+DUT_WAN_IP_CIDR=${DUT_WAN_IP_CIDR:-10.201.0.2/24}
+ROOT_IP_CIDR=${ROOT_IP_CIDR:-10.201.0.1/24}
+NFQ_QUEUE_NUM=${NFQ_QUEUE_NUM:-0}
+
+AFP_IPT_FWD_CHAIN=IPS_LAB_FWD
+AFP_IPT_NAT_CHAIN=IPS_LAB_NAT
+NFQ_IPT_ROOT_FWD_CHAIN=IPS_NFQ_LAB_FWD
+NFQ_IPT_ROOT_NAT_CHAIN=IPS_NFQ_LAB_NAT
+NFQ_IPT_DUT_FWD_CHAIN=IPS_NFQ_DUT_FWD
+NFQ_IPT_DUT_NAT_CHAIN=IPS_NFQ_DUT_NAT
+
+BR_NAME=${BR_NAME:-idsbr0}
+BR_LAN_IF=${BR_LAN_IF:-$VETH_D_IN}
+BR_WAN_IF=${BR_WAN_IF:-$VETH_D_OUT}
+
+usage() {
+    cat <<EOF
+Usage:
+  ips-lab up [afp|nfq] [--queue-bypass]
+  ips-lab down
+  ips-lab status
+  ips-lab enter [dut|client|server]
+  ips-lab setup linux-bridge [up|down]
+
+Notes:
+  - afp is the default mode for 'up'.
+  - --queue-bypass is valid only with 'up nfq'.
+  - 'setup linux-bridge' must be run from inside the AF_PACKET DUT shell.
+EOF
+}
+
+preserved_env() {
+    local vars=(
+        IPS_LAB_STATE_FILE IPS_LAB_AFP_STATE_FILE IPS_LAB_NFQ_STATE_FILE
+        IPS_LAB_MODE IPS_LAB_ROLE IPS_LAB_NS
+        WAN_IF LAB_MTU ROOT_IF VETH_C VETH_D_IN VETH_D_OUT
+        NS_CLIENT NS_DUT NS_SERVER
+        AFP_LAB_SUBNET_CIDR AFP_HOST_IP_CIDR AFP_CLIENT_IP_CIDR
+        LAB_SUBNET_CIDR LAB_HOST_IP_CIDR LAB_CLIENT_IP_CIDR
+        CLIENT_SUBNET_CIDR CLIENT_IP_CIDR DUT_LAN_IP_CIDR
+        UPLINK_SUBNET_CIDR DUT_WAN_IP_CIDR ROOT_IP_CIDR NFQ_QUEUE_NUM
+        BR_NAME BR_LAN_IF BR_WAN_IF PROMPT_LABEL
+        DISPLAY XAUTHORITY WAYLAND_DISPLAY XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS TERM PATH
+    )
+    local IFS=,
+    echo "${vars[*]}"
+}
+
+need_root() {
+    if [[ ${EUID} -ne 0 ]]; then
+        exec sudo --preserve-env="$(preserved_env)" "$0" "$@"
+    fi
+}
+
+need_cmd() {
+    command -v "$1" >/dev/null 2>&1 || {
+        echo "ERROR: missing command: $1" >&2
+        exit 1
+    }
+}
+
+need_common_cmds() {
+    need_cmd ip
+    need_cmd awk
+    need_cmd grep
+    need_cmd xargs
+    need_cmd sysctl
+    need_cmd iptables
+    need_cmd ethtool
+}
+
+try() {
+    "$@" >/dev/null 2>&1 || true
+}
+
+namespace_exists() {
+    ip netns list | awk '{print $1}' | grep -qx "$1"
+}
+
+link_exists() {
+    ip link show dev "$1" >/dev/null 2>&1
+}
+
+ip_no_cidr() {
+    echo "${1%%/*}"
+}
+
+afp_client_gateway_ip() {
+    ip_no_cidr "$AFP_HOST_IP_CIDR"
+}
+
+detect_wan_if() {
+    if [[ -n "${WAN_IF:-}" ]]; then
+        echo "$WAN_IF"
+        return
+    fi
+
+    ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i == "dev") { print $(i+1); exit }}'
+}
+
+disable_offloads() {
+    local ns="$1"
+    local iface="$2"
+    local feature
+
+    for feature in tso gro lro gso rx tx sg rxvlan txvlan; do
+        try ip netns exec "$ns" ethtool -K "$iface" "$feature" off
+    done
+}
+
+kill_ns_processes() {
+    local ns="$1"
+    if namespace_exists "$ns"; then
+        ip netns pids "$ns" 2>/dev/null | xargs -r kill >/dev/null 2>&1 || true
+        sleep 0.1
+        ip netns pids "$ns" 2>/dev/null | xargs -r kill -9 >/dev/null 2>&1 || true
+    fi
+}
+
+save_super_state() {
+    local mode="$1"
+    local old_ipfwd="$2"
+    local wan_if="$3"
+
+    cat >"$SUPER_STATE_FILE" <<EOF
+MODE=$mode
+OLD_IP_FORWARD=$old_ipfwd
+WAN_IF=$wan_if
+NS_CLIENT=$NS_CLIENT
+NS_DUT=$NS_DUT
+NS_SERVER=$NS_SERVER
+ROOT_IF=$ROOT_IF
+VETH_C=$VETH_C
+VETH_D_IN=$VETH_D_IN
+VETH_D_OUT=$VETH_D_OUT
+BR_NAME=$BR_NAME
+BR_LAN_IF=$BR_LAN_IF
+BR_WAN_IF=$BR_WAN_IF
+EOF
+}
+
+save_afp_state() {
+    local wan_if="$1"
+    local old_ipfwd="$2"
+
+    cat >"$AFP_STATE_FILE" <<EOF
+WAN_IF=$wan_if
+OLD_IP_FORWARD=$old_ipfwd
+EOF
+}
+
+save_nfq_state() {
+    local wan_if="$1"
+    local old_ipfwd="$2"
+
+    cat >"$NFQ_STATE_FILE" <<EOF
+WAN_IF=$wan_if
+OLD_IP_FORWARD=$old_ipfwd
+EOF
+}
+
+active_mode() {
+    if [[ -f "$SUPER_STATE_FILE" ]]; then
+        # shellcheck source=/dev/null
+        source "$SUPER_STATE_FILE"
+        [[ -n "${MODE:-}" ]] && echo "$MODE" && return
+    fi
+
+    if [[ -f "$NFQ_STATE_FILE" ]]; then
+        echo nfq
+    elif [[ -f "$AFP_STATE_FILE" ]]; then
+        echo afp
+    else
+        echo unknown
+    fi
+}
+
+restore_ip_forward_from_state() {
+    local mode="$1"
+    local old=""
+
+    if [[ -f "$SUPER_STATE_FILE" ]]; then
+        # shellcheck source=/dev/null
+        source "$SUPER_STATE_FILE"
+        old="${OLD_IP_FORWARD:-}"
+    elif [[ "$mode" == "nfq" && -f "$NFQ_STATE_FILE" ]]; then
+        # shellcheck source=/dev/null
+        source "$NFQ_STATE_FILE"
+        old="${OLD_IP_FORWARD:-}"
+    elif [[ "$mode" == "afp" && -f "$AFP_STATE_FILE" ]]; then
+        # shellcheck source=/dev/null
+        source "$AFP_STATE_FILE"
+        old="${OLD_IP_FORWARD:-}"
+    fi
+
+    if [[ -n "$old" ]]; then
+        sysctl -w net.ipv4.ip_forward="$old" >/dev/null
+    fi
+}
+
+iptables_setup_afp_root() {
+    local wan_if="$1"
+
+    try iptables -N "$AFP_IPT_FWD_CHAIN"
+    iptables -F "$AFP_IPT_FWD_CHAIN"
+    iptables -A "$AFP_IPT_FWD_CHAIN" -i "$ROOT_IF" -o "$wan_if" -j ACCEPT
+    iptables -A "$AFP_IPT_FWD_CHAIN" -i "$wan_if" -o "$ROOT_IF" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    iptables -C FORWARD -j "$AFP_IPT_FWD_CHAIN" >/dev/null 2>&1 || iptables -I FORWARD 1 -j "$AFP_IPT_FWD_CHAIN"
+
+    try iptables -t nat -N "$AFP_IPT_NAT_CHAIN"
+    iptables -t nat -F "$AFP_IPT_NAT_CHAIN"
+    iptables -t nat -A "$AFP_IPT_NAT_CHAIN" -s "$AFP_LAB_SUBNET_CIDR" -o "$wan_if" -j MASQUERADE
+    iptables -t nat -C POSTROUTING -j "$AFP_IPT_NAT_CHAIN" >/dev/null 2>&1 || iptables -t nat -I POSTROUTING 1 -j "$AFP_IPT_NAT_CHAIN"
+}
+
+iptables_teardown_afp_root() {
+    while iptables -C FORWARD -j "$AFP_IPT_FWD_CHAIN" >/dev/null 2>&1; do
+        iptables -D FORWARD -j "$AFP_IPT_FWD_CHAIN" || true
+    done
+
+    while iptables -t nat -C POSTROUTING -j "$AFP_IPT_NAT_CHAIN" >/dev/null 2>&1; do
+        iptables -t nat -D POSTROUTING -j "$AFP_IPT_NAT_CHAIN" || true
+    done
+
+    try iptables -F "$AFP_IPT_FWD_CHAIN"
+    try iptables -X "$AFP_IPT_FWD_CHAIN"
+    try iptables -t nat -F "$AFP_IPT_NAT_CHAIN"
+    try iptables -t nat -X "$AFP_IPT_NAT_CHAIN"
+}
+
+iptables_setup_nfq_root() {
+    local wan_if="$1"
+
+    try iptables -N "$NFQ_IPT_ROOT_FWD_CHAIN"
+    iptables -F "$NFQ_IPT_ROOT_FWD_CHAIN"
+    iptables -A "$NFQ_IPT_ROOT_FWD_CHAIN" -i "$ROOT_IF" -o "$wan_if" -j ACCEPT
+    iptables -A "$NFQ_IPT_ROOT_FWD_CHAIN" -i "$wan_if" -o "$ROOT_IF" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    iptables -C FORWARD -j "$NFQ_IPT_ROOT_FWD_CHAIN" >/dev/null 2>&1 || iptables -I FORWARD 1 -j "$NFQ_IPT_ROOT_FWD_CHAIN"
+
+    try iptables -t nat -N "$NFQ_IPT_ROOT_NAT_CHAIN"
+    iptables -t nat -F "$NFQ_IPT_ROOT_NAT_CHAIN"
+    iptables -t nat -A "$NFQ_IPT_ROOT_NAT_CHAIN" -s "$UPLINK_SUBNET_CIDR" -o "$wan_if" -j MASQUERADE
+    iptables -t nat -C POSTROUTING -j "$NFQ_IPT_ROOT_NAT_CHAIN" >/dev/null 2>&1 || iptables -t nat -I POSTROUTING 1 -j "$NFQ_IPT_ROOT_NAT_CHAIN"
+}
+
+iptables_teardown_nfq_root() {
+    while iptables -C FORWARD -j "$NFQ_IPT_ROOT_FWD_CHAIN" >/dev/null 2>&1; do
+        iptables -D FORWARD -j "$NFQ_IPT_ROOT_FWD_CHAIN" || true
+    done
+
+    while iptables -t nat -C POSTROUTING -j "$NFQ_IPT_ROOT_NAT_CHAIN" >/dev/null 2>&1; do
+        iptables -t nat -D POSTROUTING -j "$NFQ_IPT_ROOT_NAT_CHAIN" || true
+    done
+
+    try iptables -F "$NFQ_IPT_ROOT_FWD_CHAIN"
+    try iptables -X "$NFQ_IPT_ROOT_FWD_CHAIN"
+    try iptables -t nat -F "$NFQ_IPT_ROOT_NAT_CHAIN"
+    try iptables -t nat -X "$NFQ_IPT_ROOT_NAT_CHAIN"
+}
+
+iptables_setup_nfq_dut_nat() {
+    try ip netns exec "$NS_DUT" iptables -t nat -N "$NFQ_IPT_DUT_NAT_CHAIN"
+    ip netns exec "$NS_DUT" iptables -t nat -F "$NFQ_IPT_DUT_NAT_CHAIN"
+    ip netns exec "$NS_DUT" iptables -t nat -A "$NFQ_IPT_DUT_NAT_CHAIN" -s "$CLIENT_SUBNET_CIDR" -o "$VETH_D_OUT" -j MASQUERADE
+    ip netns exec "$NS_DUT" iptables -t nat -C POSTROUTING -j "$NFQ_IPT_DUT_NAT_CHAIN" >/dev/null 2>&1 || \
+        ip netns exec "$NS_DUT" iptables -t nat -I POSTROUTING 1 -j "$NFQ_IPT_DUT_NAT_CHAIN"
+}
+
+iptables_setup_nfq_dut_forward() {
+    local queue_bypass="$1"
+    local -a nfq_args=(-j NFQUEUE --queue-num "$NFQ_QUEUE_NUM")
+
+    if [[ "$queue_bypass" == "1" ]]; then
+        nfq_args+=(--queue-bypass)
+    fi
+
+    try ip netns exec "$NS_DUT" iptables -N "$NFQ_IPT_DUT_FWD_CHAIN"
+    ip netns exec "$NS_DUT" iptables -F "$NFQ_IPT_DUT_FWD_CHAIN"
+    ip netns exec "$NS_DUT" iptables -A "$NFQ_IPT_DUT_FWD_CHAIN" -i "$VETH_D_IN" -o "$VETH_D_OUT" "${nfq_args[@]}"
+    ip netns exec "$NS_DUT" iptables -A "$NFQ_IPT_DUT_FWD_CHAIN" -i "$VETH_D_OUT" -o "$VETH_D_IN" "${nfq_args[@]}"
+    ip netns exec "$NS_DUT" iptables -C FORWARD -j "$NFQ_IPT_DUT_FWD_CHAIN" >/dev/null 2>&1 || \
+        ip netns exec "$NS_DUT" iptables -I FORWARD 1 -j "$NFQ_IPT_DUT_FWD_CHAIN"
+}
+
+iptables_teardown_nfq_dut() {
+    if ! namespace_exists "$NS_DUT"; then
+        return 0
+    fi
+
+    while ip netns exec "$NS_DUT" iptables -C FORWARD -j "$NFQ_IPT_DUT_FWD_CHAIN" >/dev/null 2>&1; do
+        ip netns exec "$NS_DUT" iptables -D FORWARD -j "$NFQ_IPT_DUT_FWD_CHAIN" || true
+    done
+
+    while ip netns exec "$NS_DUT" iptables -t nat -C POSTROUTING -j "$NFQ_IPT_DUT_NAT_CHAIN" >/dev/null 2>&1; do
+        ip netns exec "$NS_DUT" iptables -t nat -D POSTROUTING -j "$NFQ_IPT_DUT_NAT_CHAIN" || true
+    done
+
+    try ip netns exec "$NS_DUT" iptables -F "$NFQ_IPT_DUT_FWD_CHAIN"
+    try ip netns exec "$NS_DUT" iptables -X "$NFQ_IPT_DUT_FWD_CHAIN"
+    try ip netns exec "$NS_DUT" iptables -t nat -F "$NFQ_IPT_DUT_NAT_CHAIN"
+    try ip netns exec "$NS_DUT" iptables -t nat -X "$NFQ_IPT_DUT_NAT_CHAIN"
+}
+
+setup_links_afp() {
+    ip netns add "$NS_CLIENT"
+    ip netns add "$NS_DUT"
+
+    ip -n "$NS_CLIENT" link set lo up
+    ip -n "$NS_DUT" link set lo up
+
+    ip link add "$VETH_C" type veth peer name "$VETH_D_IN"
+    ip link add "$VETH_D_OUT" type veth peer name "$ROOT_IF"
+
+    ip link set "$VETH_C" netns "$NS_CLIENT"
+    ip link set "$VETH_D_IN" netns "$NS_DUT"
+    ip link set "$VETH_D_OUT" netns "$NS_DUT"
+
+    ip -n "$NS_CLIENT" link set "$VETH_C" mtu "$LAB_MTU"
+    ip -n "$NS_DUT" link set "$VETH_D_IN" mtu "$LAB_MTU"
+    ip -n "$NS_DUT" link set "$VETH_D_OUT" mtu "$LAB_MTU"
+    ip link set "$ROOT_IF" mtu "$LAB_MTU"
+
+    ip -n "$NS_CLIENT" link set "$VETH_C" up
+    disable_offloads "$NS_CLIENT" "$VETH_C"
+    ip -n "$NS_CLIENT" addr replace "$AFP_CLIENT_IP_CIDR" dev "$VETH_C"
+    ip -n "$NS_CLIENT" route replace default via "$(afp_client_gateway_ip)"
+    ip netns exec "$NS_CLIENT" sysctl -w net.ipv4.ping_group_range="0 2147483647" >/dev/null
+
+    ip -n "$NS_DUT" link set "$VETH_D_IN" up
+    disable_offloads "$NS_DUT" "$VETH_D_IN"
+    ip -n "$NS_DUT" link set "$VETH_D_OUT" up
+    disable_offloads "$NS_DUT" "$VETH_D_OUT"
+    ip netns exec "$NS_DUT" sysctl -w net.ipv4.ping_group_range="0 2147483647" >/dev/null
+
+    ip link set "$ROOT_IF" up
+    ip addr replace "$AFP_HOST_IP_CIDR" dev "$ROOT_IF"
+}
+
+setup_links_nfq() {
+    ip netns add "$NS_CLIENT"
+    ip netns add "$NS_DUT"
+
+    ip -n "$NS_CLIENT" link set lo up
+    ip -n "$NS_DUT" link set lo up
+
+    ip link add "$VETH_C" type veth peer name "$VETH_D_IN"
+    ip link add "$VETH_D_OUT" type veth peer name "$ROOT_IF"
+
+    ip link set "$VETH_C" netns "$NS_CLIENT"
+    ip link set "$VETH_D_IN" netns "$NS_DUT"
+    ip link set "$VETH_D_OUT" netns "$NS_DUT"
+
+    ip -n "$NS_CLIENT" link set "$VETH_C" mtu "$LAB_MTU"
+    ip -n "$NS_DUT" link set "$VETH_D_IN" mtu "$LAB_MTU"
+    ip -n "$NS_DUT" link set "$VETH_D_OUT" mtu "$LAB_MTU"
+    ip link set "$ROOT_IF" mtu "$LAB_MTU"
+
+    ip -n "$NS_CLIENT" link set "$VETH_C" up
+    disable_offloads "$NS_CLIENT" "$VETH_C"
+    ip -n "$NS_CLIENT" addr replace "$CLIENT_IP_CIDR" dev "$VETH_C"
+    ip -n "$NS_CLIENT" route replace default via "$(ip_no_cidr "$DUT_LAN_IP_CIDR")"
+    ip netns exec "$NS_CLIENT" sysctl -w net.ipv4.ping_group_range="0 2147483647" >/dev/null
+
+    ip -n "$NS_DUT" link set "$VETH_D_IN" up
+    disable_offloads "$NS_DUT" "$VETH_D_IN"
+    ip -n "$NS_DUT" addr replace "$DUT_LAN_IP_CIDR" dev "$VETH_D_IN"
+    ip -n "$NS_DUT" link set "$VETH_D_OUT" up
+    disable_offloads "$NS_DUT" "$VETH_D_OUT"
+    ip -n "$NS_DUT" addr replace "$DUT_WAN_IP_CIDR" dev "$VETH_D_OUT"
+    ip -n "$NS_DUT" route replace default via "$(ip_no_cidr "$ROOT_IP_CIDR")"
+    ip netns exec "$NS_DUT" sysctl -w net.ipv4.ip_forward=1 >/dev/null
+    ip netns exec "$NS_DUT" sysctl -w net.ipv4.ping_group_range="0 2147483647" >/dev/null
+
+    ip link set "$ROOT_IF" up
+    ip addr replace "$ROOT_IP_CIDR" dev "$ROOT_IF"
+}
+
+do_down() {
+    local mode
+
+    if [[ -f "$SUPER_STATE_FILE" ]]; then
+        # shellcheck source=/dev/null
+        source "$SUPER_STATE_FILE"
+        mode="${MODE:-unknown}"
+    else
+        mode=$(active_mode)
+    fi
+
+    iptables_teardown_nfq_dut
+    iptables_teardown_nfq_root
+    iptables_teardown_afp_root
+
+    restore_ip_forward_from_state "$mode"
+
+    kill_ns_processes "$NS_CLIENT"
+    kill_ns_processes "$NS_DUT"
+    kill_ns_processes "$NS_SERVER"
+
+    try ip link del "$ROOT_IF"
+    try ip link del "$VETH_C"
+    try ip link del "$VETH_D_IN"
+    try ip link del "$VETH_D_OUT"
+
+    # Clean up any leftover veth names from Suricata CI-style experiments.
+    try ip link del cpa
+    try ip link del cpb
+    try ip link del dia
+    try ip link del dib
+    try ip link del doa
+    try ip link del dob
+    try ip link del hoa
+    try ip link del hob
+
+    try ip netns del "$NS_CLIENT"
+    try ip netns del "$NS_DUT"
+    try ip netns del "$NS_SERVER"
+
+    rm -f "$SUPER_STATE_FILE" "$AFP_STATE_FILE" "$NFQ_STATE_FILE"
+}
+
+do_up_afp() {
+    local wan_if
+    local old_ipfwd
+
+    wan_if=$(detect_wan_if)
+    if [[ -z "$wan_if" ]]; then
+        echo "ERROR: could not detect WAN_IF. Set WAN_IF=<iface> and retry." >&2
+        exit 1
+    fi
+
+    if [[ "$wan_if" == "$ROOT_IF" ]]; then
+        echo "ERROR: WAN_IF cannot be $ROOT_IF" >&2
+        exit 1
+    fi
+
+    do_down >/dev/null 2>&1 || true
+
+    old_ipfwd=$(sysctl -n net.ipv4.ip_forward)
+    setup_links_afp
+    iptables_setup_afp_root "$wan_if"
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null
+    save_afp_state "$wan_if" "$old_ipfwd"
+    save_super_state afp "$old_ipfwd" "$wan_if"
+
+    echo "AF_PACKET lab is up."
+    echo "  WAN_IF: $wan_if"
+    echo "  Client namespace: $NS_CLIENT ($VETH_C: $AFP_CLIENT_IP_CIDR)"
+    echo "  DUT namespace:    $NS_DUT ($VETH_D_IN and $VETH_D_OUT are L2 only)"
+    echo "  Root/server side: $ROOT_IF ($AFP_HOST_IP_CIDR)"
+    echo
+    echo "Enter DUT:     ips-lab enter dut"
+    echo "Enter client:  ips-lab enter client"
+    echo "Linux bridge:  ips-lab enter dut, then ips-lab setup linux-bridge"
+}
+
+do_up_nfq() {
+    local queue_bypass="$1"
+    local wan_if
+    local old_ipfwd
+
+    wan_if=$(detect_wan_if)
+    if [[ -z "$wan_if" ]]; then
+        echo "ERROR: could not detect WAN_IF. Set WAN_IF=<iface> and retry." >&2
+        exit 1
+    fi
+
+    if [[ "$wan_if" == "$ROOT_IF" ]]; then
+        echo "ERROR: WAN_IF cannot be $ROOT_IF" >&2
+        exit 1
+    fi
+
+    do_down >/dev/null 2>&1 || true
+
+    old_ipfwd=$(sysctl -n net.ipv4.ip_forward)
+    setup_links_nfq
+    iptables_setup_nfq_dut_nat
+    iptables_setup_nfq_dut_forward "$queue_bypass"
+    iptables_setup_nfq_root "$wan_if"
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null
+    save_nfq_state "$wan_if" "$old_ipfwd"
+    save_super_state nfq "$old_ipfwd" "$wan_if"
+
+    echo "NFQ lab is up."
+    echo "  WAN_IF: $wan_if"
+    echo "  Client namespace: $NS_CLIENT ($VETH_C: $CLIENT_IP_CIDR)"
+    echo "  DUT namespace:    $NS_DUT ($VETH_D_IN: $DUT_LAN_IP_CIDR, $VETH_D_OUT: $DUT_WAN_IP_CIDR)"
+    echo "  Root/server side: $ROOT_IF ($ROOT_IP_CIDR)"
+    echo "  NFQUEUE:          queue $NFQ_QUEUE_NUM (queue-bypass $( [[ "$queue_bypass" == "1" ]] && echo on || echo off ))"
+    echo
+    echo "Enter DUT:     ips-lab enter dut"
+    echo "Enter client:  ips-lab enter client"
+}
+
+do_status() {
+    local mode
+
+    if [[ -f "$SUPER_STATE_FILE" ]]; then
+        # shellcheck source=/dev/null
+        source "$SUPER_STATE_FILE"
+        mode="${MODE:-unknown}"
+    else
+        mode=$(active_mode)
+    fi
+
+    echo "Mode: $mode"
+    echo
+    echo "Namespaces:"
+    ip netns list || true
+
+    echo
+    echo "Root/server side:"
+    ip -br link show "$ROOT_IF" 2>/dev/null || true
+    ip -br addr show "$ROOT_IF" 2>/dev/null || true
+    iptables -S "$AFP_IPT_FWD_CHAIN" 2>/dev/null || true
+    iptables -t nat -S "$AFP_IPT_NAT_CHAIN" 2>/dev/null || true
+    iptables -S "$NFQ_IPT_ROOT_FWD_CHAIN" 2>/dev/null || true
+    iptables -t nat -S "$NFQ_IPT_ROOT_NAT_CHAIN" 2>/dev/null || true
+
+    echo
+    echo "Client namespace ($NS_CLIENT):"
+    ip netns exec "$NS_CLIENT" ip -br link 2>/dev/null || true
+    ip netns exec "$NS_CLIENT" ip -br addr 2>/dev/null || true
+    ip netns exec "$NS_CLIENT" ip route 2>/dev/null || true
+
+    echo
+    echo "DUT namespace ($NS_DUT):"
+    ip netns exec "$NS_DUT" ip -br link 2>/dev/null || true
+    ip netns exec "$NS_DUT" ip -br addr 2>/dev/null || true
+    ip netns exec "$NS_DUT" ip route 2>/dev/null || true
+    ip netns exec "$NS_DUT" sysctl net.ipv4.ip_forward 2>/dev/null || true
+    ip netns exec "$NS_DUT" iptables -S FORWARD 2>/dev/null || true
+    ip netns exec "$NS_DUT" iptables -S "$NFQ_IPT_DUT_FWD_CHAIN" 2>/dev/null || true
+    ip netns exec "$NS_DUT" iptables -t nat -S "$NFQ_IPT_DUT_NAT_CHAIN" 2>/dev/null || true
+}
+
+shell_env_args() {
+    local role="$1"
+    local mode="$2"
+    local target_user="$3"
+    local target_home="$4"
+    local prompt_label="${PROMPT_LABEL:-ips-lab}"
+    local prompt="[$prompt_label:$role] \\u@\\h:\\w\\$ "
+
+    printf '%s\0' \
+        "HOME=$target_home" \
+        "USER=$target_user" \
+        "LOGNAME=$target_user" \
+        "SHELL=/bin/bash" \
+        "TERM=${TERM:-xterm-256color}" \
+        "PATH=${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}" \
+        "PS1=$prompt" \
+        "IPS_LAB_MODE=$mode" \
+        "IPS_LAB_ROLE=$role" \
+        "NS_CLIENT=$NS_CLIENT" \
+        "NS_DUT=$NS_DUT" \
+        "NS_SERVER=$NS_SERVER" \
+        "ROOT_IF=$ROOT_IF" \
+        "VETH_C=$VETH_C" \
+        "VETH_D_IN=$VETH_D_IN" \
+        "VETH_D_OUT=$VETH_D_OUT" \
+        "BR_NAME=$BR_NAME" \
+        "BR_LAN_IF=$BR_LAN_IF" \
+        "BR_WAN_IF=$BR_WAN_IF"
+
+    [[ -n "${DISPLAY:-}" ]] && printf '%s\0' "DISPLAY=$DISPLAY"
+    [[ -n "${XAUTHORITY:-}" ]] && printf '%s\0' "XAUTHORITY=$XAUTHORITY"
+    [[ -n "${WAYLAND_DISPLAY:-}" ]] && printf '%s\0' "WAYLAND_DISPLAY=$WAYLAND_DISPLAY"
+    [[ -n "${XDG_RUNTIME_DIR:-}" ]] && printf '%s\0' "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR"
+    [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]] && printf '%s\0' "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS"
+}
+
+enter_shell() {
+    local role="$1"
+    local ns=""
+    local mode
+    local target_user
+    local target_home
+    local -a env_args=()
+    local arg
+
+    if [[ -f "$SUPER_STATE_FILE" ]]; then
+        # shellcheck source=/dev/null
+        source "$SUPER_STATE_FILE"
+        mode="${MODE:-unknown}"
+    else
+        mode=$(active_mode)
+    fi
+
+    case "$role" in
+        dut)
+            ns="$NS_DUT"
+            ;;
+        client)
+            ns="$NS_CLIENT"
+            ;;
+        server)
+            # The current labs use the root namespace as the upstream/server side.
+            ns=""
+            ;;
+        *)
+            usage >&2
+            exit 1
+            ;;
+    esac
+
+    if [[ -n "$ns" ]] && ! namespace_exists "$ns"; then
+        echo "ERROR: namespace does not exist: $ns" >&2
+        exit 1
+    fi
+
+    target_user=root
+    if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+        target_user="$SUDO_USER"
+    fi
+
+    target_home=$(getent passwd "$target_user" | awk -F: '{print $6}')
+    if [[ -z "$target_home" ]]; then
+        echo "ERROR: could not determine home directory for $target_user" >&2
+        exit 1
+    fi
+
+    while IFS= read -r -d '' arg; do
+        env_args+=("$arg")
+    done < <(shell_env_args "$role" "$mode" "$target_user" "$target_home")
+
+    if [[ "$role" == "dut" ]]; then
+        ip netns exec "$ns" sysctl -w net.ipv4.ping_group_range="0 2147483647" >/dev/null || true
+    fi
+
+    if [[ -n "$ns" ]]; then
+        if [[ "$target_user" != "root" ]]; then
+            exec ip netns exec "$ns" runuser -u "$target_user" -- env "${env_args[@]}" bash --noprofile --norc -i
+        fi
+        exec ip netns exec "$ns" env "${env_args[@]}" bash --noprofile --norc -i
+    fi
+
+    if [[ "$target_user" != "root" ]]; then
+        exec runuser -u "$target_user" -- env "${env_args[@]}" bash --noprofile --norc -i
+    fi
+    exec env "${env_args[@]}" bash --noprofile --norc -i
+}
+
+current_namespace_name() {
+    ip netns identify "$$" 2>/dev/null | awk 'NR == 1 {print; exit}'
+}
+
+interface_has_ipv4() {
+    ip -4 addr show dev "$1" 2>/dev/null | grep -q 'inet '
+}
+
+inside_afp_dut() {
+    if [[ "${IPS_LAB_MODE:-}" == "afp" && "${IPS_LAB_ROLE:-}" == "dut" ]] && link_exists "$BR_LAN_IF" && link_exists "$BR_WAN_IF"; then
+        return 0
+    fi
+
+    if [[ "$(active_mode)" == "afp" ]] && [[ "$(current_namespace_name)" == "$NS_DUT" ]] && link_exists "$BR_LAN_IF" && link_exists "$BR_WAN_IF"; then
+        return 0
+    fi
+
+    # Fallback for shells that did not inherit IPS_LAB_*: the AF_PACKET DUT has
+    # lan0/wan0 as pure L2 links, while the NFQ DUT assigns IPv4 addresses.
+    if link_exists "$BR_LAN_IF" && link_exists "$BR_WAN_IF" && ! interface_has_ipv4 "$BR_LAN_IF" && ! interface_has_ipv4 "$BR_WAN_IF"; then
+        return 0
+    fi
+
+    return 1
+}
+
+bridge_current_master() {
+    ip -o link show dev "$1" | awk '
+        {
+            for (i = 1; i <= NF; i++) {
+                if ($i == "master") {
+                    print $(i + 1)
+                    exit
+                }
+            }
+        }
+    '
+}
+
+bridge_members() {
+    ip -o link show master "$BR_NAME" | awk -F': ' '{print $2}' | awk -F'@' '{print $1}'
+}
+
+linux_bridge_up() {
+    local master
+
+    if ! inside_afp_dut; then
+        echo "ERROR: linux-bridge setup must be run inside the AF_PACKET DUT." >&2
+        echo "Hint: run 'ips-lab up afp', then 'ips-lab enter dut', then 'ips-lab setup linux-bridge'." >&2
+        exit 1
+    fi
+
+    if ! link_exists "$BR_LAN_IF"; then
+        echo "ERROR: interface does not exist: $BR_LAN_IF" >&2
+        exit 1
+    fi
+
+    if ! link_exists "$BR_WAN_IF"; then
+        echo "ERROR: interface does not exist: $BR_WAN_IF" >&2
+        exit 1
+    fi
+
+    if link_exists "$BR_NAME"; then
+        echo "ERROR: bridge already exists: $BR_NAME" >&2
+        exit 1
+    fi
+
+    master=$(bridge_current_master "$BR_LAN_IF")
+    if [[ -n "$master" ]]; then
+        echo "ERROR: $BR_LAN_IF is already attached to master $master" >&2
+        exit 1
+    fi
+
+    master=$(bridge_current_master "$BR_WAN_IF")
+    if [[ -n "$master" ]]; then
+        echo "ERROR: $BR_WAN_IF is already attached to master $master" >&2
+        exit 1
+    fi
+
+    ip link add name "$BR_NAME" type bridge
+    ip link set dev "$BR_NAME" type bridge stp_state 0 forward_delay 0
+
+    ip link set dev "$BR_LAN_IF" down
+    ip link set dev "$BR_WAN_IF" down
+
+    ip link set dev "$BR_LAN_IF" master "$BR_NAME"
+    ip link set dev "$BR_WAN_IF" master "$BR_NAME"
+
+    ip link set dev "$BR_LAN_IF" up
+    ip link set dev "$BR_WAN_IF" up
+    ip link set dev "$BR_NAME" up
+
+    echo "Bridge created: $BR_NAME"
+    echo "  lan: $BR_LAN_IF"
+    echo "  wan: $BR_WAN_IF"
+}
+
+linux_bridge_down() {
+    local members=()
+    local member
+
+    if ! inside_afp_dut; then
+        echo "ERROR: linux-bridge teardown must be run inside the AF_PACKET DUT." >&2
+        exit 1
+    fi
+
+    if ! link_exists "$BR_NAME"; then
+        echo "Bridge does not exist: $BR_NAME"
+        return 0
+    fi
+
+    while IFS= read -r member; do
+        [[ -n "$member" ]] && members+=("$member")
+    done < <(bridge_members)
+
+    try ip link set dev "$BR_NAME" down
+    try ip link delete "$BR_NAME" type bridge
+
+    for member in "${members[@]}"; do
+        if link_exists "$member"; then
+            try ip link set dev "$member" up
+        fi
+    done
+
+    echo "Bridge removed: $BR_NAME"
+}
+
+main() {
+    local cmd="${1:-}"
+    shift || true
+
+    case "$cmd" in
+        up)
+            local mode="${1:-afp}"
+            local queue_bypass=0
+            local arg
+
+            if [[ "$mode" == "afp" || "$mode" == "nfq" ]]; then
+                shift || true
+            else
+                mode=afp
+            fi
+
+            for arg in "$@"; do
+                case "$arg" in
+                    --queue-bypass)
+                        queue_bypass=1
+                        ;;
+                    *)
+                        usage >&2
+                        exit 1
+                        ;;
+                esac
+            done
+
+            if [[ "$mode" == "afp" && $queue_bypass -eq 1 ]]; then
+                echo "ERROR: --queue-bypass is valid only with 'up nfq'." >&2
+                exit 1
+            fi
+
+            need_root up "$mode" "$@"
+            need_common_cmds
+
+            case "$mode" in
+                afp)
+                    do_up_afp
+                    ;;
+                nfq)
+                    do_up_nfq "$queue_bypass"
+                    ;;
+                *)
+                    usage >&2
+                    exit 1
+                    ;;
+            esac
+            ;;
+        down)
+            if [[ $# -ne 0 ]]; then
+                usage >&2
+                exit 1
+            fi
+            need_root down
+            need_common_cmds
+            do_down
+            echo "Lab torn down."
+            ;;
+        status)
+            if [[ $# -ne 0 ]]; then
+                usage >&2
+                exit 1
+            fi
+            need_root status
+            need_common_cmds
+            do_status
+            ;;
+        enter)
+            local role="${1:-dut}"
+            if [[ $# -gt 1 ]]; then
+                usage >&2
+                exit 1
+            fi
+            case "$role" in
+                dut|client|server)
+                    ;;
+                *)
+                    usage >&2
+                    exit 1
+                    ;;
+            esac
+            need_root enter "$role"
+            need_cmd ip
+            need_cmd awk
+            need_cmd grep
+            need_cmd getent
+            need_cmd runuser
+            enter_shell "$role"
+            ;;
+        setup)
+            local target="${1:-}"
+            local action="${2:-up}"
+            if [[ "$target" != "linux-bridge" || $# -gt 2 ]]; then
+                usage >&2
+                exit 1
+            fi
+            case "$action" in
+                up|down)
+                    ;;
+                *)
+                    usage >&2
+                    exit 1
+                    ;;
+            esac
+            need_root setup "$target" "$action"
+            need_cmd ip
+            need_cmd awk
+            need_cmd grep
+            case "$action" in
+                up)
+                    linux_bridge_up
+                    ;;
+                down)
+                    linux_bridge_down
+                    ;;
+            esac
+            ;;
+        help|-h|--help)
+            usage
+            ;;
+        "")
+            usage >&2
+            exit 1
+            ;;
+        *)
+            usage >&2
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
